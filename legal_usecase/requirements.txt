@@ -1,0 +1,2 @@
+quotientai
+tavily-python
