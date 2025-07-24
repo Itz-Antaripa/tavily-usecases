@@ -4,7 +4,7 @@ Legal Research with Tavily + Quotient AI
 1.  Ask a legal question in natural language
 2.  LangChain agent with Tavily tools to fetch top-ranked legal search with citations
 3.  Pass sources + question to OpenAI for legal memo generation
-4. Quotient for automatic monitoring and evaluation
+4.  Quotient for automatic monitoring and evaluation
 
 Prerequisites:
 pip install tavily-python quotientai openai tiktoken
