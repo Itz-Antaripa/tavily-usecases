@@ -1,10 +1,10 @@
 """
-1.  Ask a plain-English legal question
-2.  Fetch top-ranked legal search with citations using Tavily
-3.  Pass sources + question to OpenAI to draft a memo
-4.  Stream everything to Quotient AI so the
-    • Relevance evaluator filters noisy docs
-    • Hallucination / citation checks run automatically
+Legal Research with Tavily + Quotient AI
+
+1.  Ask a legal question in natural language
+2.  LangChain agent with Tavily tools to fetch top-ranked legal search with citations
+3.  Pass sources + question to OpenAI for legal memo generation
+4. Quotient for automatic monitoring and evaluation
 
 Prerequisites:
 pip install tavily-python quotientai openai tiktoken
@@ -14,15 +14,16 @@ export OPENAI_API_KEY=sk-xxx
 export QUOTIENT_API_KEY=qta-xxx
 """
 
-import os
 import logging
 from datetime import datetime
 from typing import List, Dict, Any
-from enum import Enum
 
 from dotenv import load_dotenv
-from tavily import TavilyClient
-from openai import OpenAI
+from langchain.agents import create_openai_tools_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_openai import ChatOpenAI
+from langchain_tavily import TavilySearch, TavilyExtract
+from langchain.schema import HumanMessage
 from quotientai import QuotientAI, DetectionType
 
 # Load environment variables
@@ -32,247 +33,158 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
-class ConfidenceLevel(str, Enum):
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
 # Initialize clients
-tavily = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
-llm = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
 quotient = QuotientAI()
 
-# Initialize Quotient logger for legal research
+# Initialize Quotient monitoring
 quotient.logger.init(
-    app_name="legal-research-workflow",
+    app_name="legal-research-agent",
     environment="production",
-    detections=[
-        DetectionType.HALLUCINATION,
-        DetectionType.DOCUMENT_RELEVANCY
-    ],
+    sample_rate=1.0,
+    detections=[DetectionType.HALLUCINATION, DetectionType.DOCUMENT_RELEVANCY],
     detection_sample_rate=1.0,
-    tags={"feature": "legal-research"}
+    tags={"feature": "legal-research", "model": "gpt-4o"}
 )
 
 
-# Search for legal content using Tavily with legal optimization
-def search_legal_content(query: str, max_results: int = 10):
-    """
-    Args:
-        query: Legal question
-        max_results: Maximum number of results to return from Tavily
+def create_legal_research_agent():
+    """Create a LangChain agent specialized for legal research"""
 
-    Returns:
-        List of legal sources with content and citations
-    """
-    logger.info(f"Searching legal content for: {query}")
-
-    # Enhanced query for legal research
-    legal_query = f"{query} federal law legal statute case precedent regulation"
-
-    try:
-        response = tavily.search(
-            query=legal_query,
-            max_results=max_results,
-            search_depth="advanced",  # Uses academic/legal sources
-            include_citations=True,
-            include_raw_content=True,
-            include_domains=[
-                "law.cornell.edu",
-                "supreme.justia.com",
-                "caselaw.findlaw.com",
-                "courtlistener.com",
-                "ecfr.gov",
-                "federalregister.gov"
-            ]
-        )
-
-        # Format documents for legal analysis in quotient evaluation
-        docs = [
-            f"[{i + 1}] {hit['title']}: {hit['url']}\n{hit['content']}"
-            for i, hit in enumerate(response["results"])
+    # Legal-focused Tavily tools
+    tavily_search = TavilySearch(
+        max_results=10,
+        search_depth="advanced",
+        include_domains=[
+            "law.cornell.edu",
+            "supreme.justia.com",
+            "caselaw.findlaw.com",
+            "courtlistener.com",
+            "ecfr.gov",
+            "federalregister.gov"
         ]
+    )
 
-        logger.info(f"Found {len(docs)} legal sources")
-        return docs
+    tavily_extract = TavilyExtract()
+    tools = [tavily_search, tavily_extract]
 
-    except Exception as e:
-        logger.error(f"Error in legal search: {e}")
-        return []
+    # Legal research prompt
+    today = datetime.now().strftime("%B %d, %Y")
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", f"""You are a senior legal research associate. Your task is to research legal questions and draft professional memoranda.
 
+RESEARCH PROCESS:
+1. Search for authoritative legal sources (statutes, case law, regulations)
+2. Extract detailed content from the most relevant sources
+3. Draft a comprehensive legal memorandum
 
-# Generate legal memorandum using verified sources
-def generate_legal_memo(query: str, docs: List[str]):
-    """
-    Args:
-        query: Original legal question
-        docs: Legal sources from Tavily search
-
-    Returns:
-        Tuple of (memo_content, message_history)
-    """
-    logger.info(f"Generating legal memo with {len(docs)} sources")
-
-    if not docs:
-        return "No legal sources found to generate memorandum.", []
-
-    # Prepare context and messages
-    context = "\n\n".join(docs)
-
-    system_prompt = """You are a senior legal associate drafting a professional legal memorandum.
-
-REQUIREMENTS:
-- Answer the legal question using ONLY the provided sources
-- Every legal assertion must cite the supporting source in square brackets [1], [2], etc.
-- Use proper legal memorandum format
-- If sources don't fully address the issue, state this explicitly
-- Be precise and avoid speculation
-- Include relevant case law, statutes, and regulations when available
-
-FORMAT:
+MEMORANDUM FORMAT:
 MEMORANDUM
 
 TO: Client
-FROM: Legal Research Team
-DATE: [Current Date]
+FROM: Legal Research Team  
+DATE: {today}
 RE: [Legal Question]
 
 EXECUTIVE SUMMARY
 [Brief 2-3 sentence answer]
 
 LEGAL ANALYSIS
-[Detailed analysis with citations]
+[Detailed analysis with proper citations etc.]
 
 CONCLUSION
 [Clear conclusion addressing the question]
-"""
 
-    user_prompt = f"""Question: {query}
+REQUIREMENTS:
+- Use only the sources you retrieve
+- Cite every assertion with source numbers [1], [2], etc.
+- Be precise and avoid speculation
+- If sources don't fully address the issue, state this explicitly"""),
 
-Legal Sources:
-{context}
+        MessagesPlaceholder(variable_name="messages"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
 
-Please draft a comprehensive legal memorandum addressing this question."""
+    # Create agent
+    agent = create_openai_tools_agent(llm=llm, tools=tools, prompt=prompt)
+    agent_executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=True,
+        return_intermediate_steps=True
+    )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    try:
-        response = llm.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.1,  # Low temperature for factual accuracy
-        )
-
-        memo_content = response.choices[0].message.content.strip()
-
-        # Add current date to memo
-        current_date = datetime.now().strftime("%B %d, %Y")
-        memo_content = memo_content.replace("[Current Date]", current_date)
-        memo_content = memo_content.replace("[Legal Question]", query)
-
-        return memo_content, messages
-
-    except Exception as e:
-        logger.error(f"Error generating memo: {e}")
-        return f"Error generating legal memorandum: {str(e)}", messages
+    return agent_executor
 
 
-# Log and evaluate with Quotient AI
-def evaluate_with_quotient(
-        query: str,
-        memo_content: str,
-        docs: List[str],
-        messages: List[Dict[str, Any]]
-):
-    """Args:
-        query: Original legal question
-        memo_content: Generated legal memo
-        docs: Source documents
-        messages: Message history for context
+def extract_documents_from_response(response: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Extract documents from agent response for Quotient logging"""
+
+    documents = []
+
+    for step in response.get("intermediate_steps", []):
+        tool_call, tool_output = step
+        tool_name = getattr(tool_call, "tool", "")
+
+        # Handle TavilyExtract - full content
+        if tool_name == "tavily_extract":
+            for result in tool_output.get('results', []):
+                doc = {
+                    "page_content": result.get('raw_content', ''),
+                    "metadata": {"source": result.get('url', ''), "tool": "tavily_extract"}
+                }
+                documents.append(doc)
+
+        # Handle TavilySearch - snippets
+        elif tool_name == "tavily_search":
+            for result in tool_output.get('results', []):
+                doc = {
+                    "page_content": result.get('content', ''),
+                    "metadata": {"source": result.get('url', ''), "tool": "tavily_search"}
+                }
+                documents.append(doc)
+
+    return documents
+
+
+def conduct_legal_research(query: str) -> Dict[str, Any]:
+    """
+    Main legal research workflow using LangChain agent + Quotient monitoring
+
+    Args:
+        query: Legal question to research
 
     Returns:
-        Quotient detection results
+        Research results with memo and evaluation
     """
-    logger.info("Logging and evaluating with Quotient")
-
-    try:
-        # Log the interaction with Quotient
-        log_id = quotient.log(
-            user_query=query,
-            model_output=memo_content,
-            documents=docs,
-            message_history=messages
-        )
-
-        # Poll for detection results
-        detection_result = quotient.poll_for_detection(log_id=log_id)
-
-        logger.info(f"Quotient evaluation completed for log_id: {log_id}")
-        return detection_result
-
-    except Exception as e:
-        logger.error(f"Error with Quotient evaluation: {e}")
-        return {"error": str(e), "status": "failed"}
-
-
-def calculate_confidence(detection_result, num_sources: int) -> ConfidenceLevel:
-    """Calculate confidence level based on Quotient Log object and source count"""
-
-    #  Handle error case
-    if isinstance(detection_result, dict) and detection_result.get("error"):
-        return ConfidenceLevel.LOW
-
-    # Work directly with Log object attributes
-    has_hallucination = getattr(detection_result, 'has_hallucination', True)  # Default to True for safety
-    evaluations = getattr(detection_result, 'evaluations', [])
-
-    # Calculate accuracy from evaluations
-    if evaluations:
-        clean_sentences = sum(1 for eval in evaluations if not getattr(eval, 'is_hallucinated', True))
-        accuracy_rate = clean_sentences / len(evaluations)
-    else:
-        accuracy_rate = 0.0
-
-    # High confidence: No hallucinations + high accuracy + sufficient sources
-    if not has_hallucination and accuracy_rate >= 0.9 and num_sources >= 5:
-        return ConfidenceLevel.HIGH
-    # Medium confidence: No hallucinations + good accuracy + some sources
-    elif not has_hallucination and accuracy_rate >= 0.7 and num_sources >= 3:
-        return ConfidenceLevel.MEDIUM
-    else:
-        return ConfidenceLevel.LOW
-
-
-# Main legal research workflow
-def conduct_legal_research(query: str, max_results: int = 10):
-    logger.info(f"Starting legal research workflow: {query}")
+    logger.info(f"Starting legal research: {query}")
     start_time = datetime.now()
 
     try:
-        # Search legal content with Tavily
-        docs = search_legal_content(query, max_results)
-        if not docs:
-            return {
-                "query": query,
-                "error": "No legal sources found",
-                "confidence": ConfidenceLevel.LOW.value,
-                "duration_seconds": (datetime.now() - start_time).total_seconds()
-            }
-        print("Tavily sources: ", docs)
+        # Create legal research agent
+        agent_executor = create_legal_research_agent()
 
-        # Generate legal memo
-        memo_content, messages = generate_legal_memo(query, docs)
+        # Run the agent
+        response = agent_executor.invoke({
+            "messages": [HumanMessage(content=query)]
+        })
 
-        # Evaluate with Quotient
-        detection_result = evaluate_with_quotient(query, memo_content, docs, messages)
+        # Extract results
+        memo_content = response['output']
+        documents = extract_documents_from_response(response)
 
-        # Calculate confidence
-        confidence = calculate_confidence(detection_result, len(docs))
+        logger.info(f"Generated memo with {len(documents)} source documents")
+
+        # Log to Quotient for monitoring
+        log_id = quotient.log(
+            user_query=query,
+            model_output=memo_content,
+            documents=documents,
+            tags={"query_type": "legal_research"}
+        )
+
+        # Get evaluation results
+        detection_result = quotient.poll_for_detection(log_id=log_id)
 
         # Compile results
         duration = (datetime.now() - start_time).total_seconds()
@@ -280,15 +192,15 @@ def conduct_legal_research(query: str, max_results: int = 10):
         results = {
             "query": query,
             "memo": memo_content,
-            "sources": docs,
+            "documents": documents,
+            "quotient_log_id": log_id,
             "quotient_evaluation": detection_result,
-            "confidence_level": confidence.value,
-            "total_sources": len(docs),
-            "generated_at": start_time.isoformat(),
-            "duration_seconds": duration
+            "total_sources": len(documents),
+            "duration_seconds": duration,
+            "generated_at": start_time.isoformat()
         }
 
-        logger.info(f"Legal research completed in {duration:.2f}s with {confidence.value} confidence")
+        logger.info(f"Legal research completed in {duration:.2f}s")
         return results
 
     except Exception as e:
@@ -296,14 +208,13 @@ def conduct_legal_research(query: str, max_results: int = 10):
         return {
             "query": query,
             "error": str(e),
-            "confidence": ConfidenceLevel.LOW.value,
             "duration_seconds": (datetime.now() - start_time).total_seconds()
         }
 
 
 if __name__ == "__main__":
     # Run single example
-    question = "What are the requirements for establishing personal jurisdiction in federal court?"
+    question = "What is the current standard for granting summary judgment under Rule 56 of the U.S. Federal Rules of Civil Procedure?"
 
     try:
         results = conduct_legal_research(question)
